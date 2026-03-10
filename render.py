@@ -11,6 +11,16 @@ except ImportError:
     # Allow running as a master process to spawn blender workers
     pass
 
+def is_render_complete(folder, expected_views):
+    """Check if a folder contains all expected view files and they are non-empty."""
+    if not os.path.exists(folder):
+        return False
+    for v in expected_views:
+        p = os.path.join(folder, f"{v}.png")
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            return False
+    return True
+
 def setup_common_settings(resolution=2048, threads=0):
     scene = bpy.context.scene
     scene.render.resolution_x = resolution
@@ -380,7 +390,7 @@ def get_bounds():
     max_dim = max(max_c - min_c)
     return center, max_dim
 
-def render_views(output_dir, cam, center, max_dim, prefix=""):
+def render_views(output_dir, cam, center, max_dim, prefix="", args=None):
     views = {
         'front':  (math.pi/2, 0, 0),           # -Y (Looking towards +Y)
         'back':   (math.pi/2, 0, math.pi),       # +Y (Looking towards -Y)
@@ -401,7 +411,15 @@ def render_views(output_dir, cam, center, max_dim, prefix=""):
         cam.location = center + (q @ mathutils.Vector((0, 0, dist)))
         
         bpy.context.view_layer.update()
-        bpy.context.scene.render.filepath = os.path.join(folder, f"{name}.png")
+        filepath = os.path.join(folder, f"{name}.png")
+        
+        # Robust Resume Check
+        if args and not getattr(args, 'force', False):
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                print(f"INFO: Skipping existing view: {prefix}/{name}")
+                continue
+
+        bpy.context.scene.render.filepath = filepath
         bpy.ops.render.render(write_still=True)
         print(f"INFO: Rendered {prefix} {name}")
 
@@ -475,13 +493,13 @@ def render_single_mesh(input_path, output_path, args):
     if args.normals:
         setup_workbench_normals()
         prepare_mesh_objects()
-        render_views(output_path, cam_obj, center, max_dim, prefix="normals")
+        render_views(output_path, cam_obj, center, max_dim, prefix="normals", args=args)
     
     # 2. DEPTH (Cycles Shader - More precise for 16-bit)
     if args.depth:
         depth_mat = setup_cycles_depth(center, max_dim)
         prepare_mesh_objects(depth_mat)
-        render_views(output_path, cam_obj, center, max_dim, prefix="depth")
+        render_views(output_path, cam_obj, center, max_dim, prefix="depth", args=args)
 
     prepare_mesh_objects() 
     
@@ -495,7 +513,7 @@ def render_single_mesh(input_path, output_path, args):
                 obj.data.materials.clear()
                 for m in mats:
                     obj.data.materials.append(m)
-        render_views(output_path, cam_obj, center, max_dim, prefix="rgb")
+        render_views(output_path, cam_obj, center, max_dim, prefix="rgb", args=args)
 
     # 4. ALBEDO (Workbench Flat)
     if args.albedo:
@@ -507,7 +525,7 @@ def render_single_mesh(input_path, output_path, args):
                 obj.data.materials.clear()
                 for m in mats:
                     obj.data.materials.append(m)
-        render_views(output_path, cam_obj, center, max_dim, prefix="albedo")
+        render_views(output_path, cam_obj, center, max_dim, prefix="albedo", args=args)
 
     # 5. METALLIC (Cycles Data)
     if args.metallic:
@@ -521,7 +539,7 @@ def render_single_mesh(input_path, output_path, args):
                 else:
                     for slot in obj.material_slots:
                         slot.material = create_pbr_material(slot.material, 'metallic')
-        render_views(output_path, cam_obj, center, max_dim, prefix="metallic")
+        render_views(output_path, cam_obj, center, max_dim, prefix="metallic", args=args)
 
     # 6. ROUGHNESS (Cycles Data)
     if args.roughness:
@@ -535,7 +553,7 @@ def render_single_mesh(input_path, output_path, args):
                 else:
                     for slot in obj.material_slots:
                         slot.material = create_pbr_material(slot.material, 'roughness')
-        render_views(output_path, cam_obj, center, max_dim, prefix="roughness")
+        render_views(output_path, cam_obj, center, max_dim, prefix="roughness", args=args)
 
 
 def run_worker(file_info):
@@ -564,6 +582,7 @@ def run_worker(file_info):
     if args_dict.get('albedo'): cmd.append("--albedo")
     if args_dict.get('metallic'): cmd.append("--metallic")
     if args_dict.get('roughness'): cmd.append("--roughness")
+    if args_dict.get('force'): cmd.append("--force")
     
     print(f"INFO: Worker starting: {fname}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -585,6 +604,7 @@ def main():
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel Blender instances for batch mode")
     parser.add_argument("--threads", type=int, default=0, help="Internal threads per Blender instance (0 = Auto)")
     parser.add_argument("--zoom", type=float, default=1.0, help="Zoom level (higher = tighter)")
+    parser.add_argument("--force", action="store_true", help="Force overwrite existing renders")
     
     # Check if we are being called by Blender or as a standalone python script
     is_blender = False
@@ -645,6 +665,15 @@ def main():
                     m_args = copy.deepcopy(args_dict)
                     for k in ["normals", "depth", "rgb", "albedo", "metallic", "roughness"]:
                         m_args[k] = (k == m)
+                    
+                    # Robust Batch Skip
+                    if not args_dict.get('force'):
+                        expected_views = ['front', 'back', 'left', 'right', 'top', 'bottom']
+                        prefix_dir = os.path.join(output_dir, m)
+                        if is_render_complete(prefix_dir, expected_views):
+                            print(f"INFO: Skipping completed pass: {model_name} -> {m}")
+                            continue
+
                     worker_items.append((blender_path, script_path, f"{model_name}_{m}", input_path, output_dir, m_args))
                 
             with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel) as executor:
@@ -693,11 +722,16 @@ def main():
                 for k in ["normals", "depth", "rgb", "albedo", "metallic", "roughness"]:
                     t_args[k] = (k == t)
                 
-                # For map-level, we use the same input/output but add a prefix in the worker?
-                # Actually run_worker just calls the script. The script's main will then 
-                # call render_single_mesh which handles the prefixing.
-                
                 model_name = os.path.splitext(os.path.basename(args.input))[0]
+                
+                # Robust Map-Level Skip
+                if not vars(args).get('force'):
+                    expected_views = ['front', 'back', 'left', 'right', 'top', 'bottom']
+                    prefix_dir = os.path.join(args.output, t)
+                    if is_render_complete(prefix_dir, expected_views):
+                        print(f"INFO: Skipping completed map pass: {t}")
+                        continue
+
                 worker_items.append((blender_path, script_path, f"{t}_pass", args.input, args.output, t_args))
 
             with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel) as executor:
