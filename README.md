@@ -104,4 +104,4 @@ If no pass flags are provided, the script defaults to:
 
 - Single-file rendering should be run through Blender (`blender -b -P ...`).
 - For large batches, increase `--parallel` gradually to match available CPU/GPU resources.
-- Outputs are PNG RGBA at 16-bit depth.
+- Outputs are PNG RGBA with 16-bit channels.
